@@ -68,6 +68,59 @@ const restoreStock = async (items) => {
     );
 };
 
+// How many of a requested line can be bought right now (0 if the product or variant is gone)
+const getAvailable = (product, line) => {
+    const variant = product?.variants.find((v) => v.size === line.size && v.color === line.color);
+    return !product || product.isActive === false || !variant ? 0 : variant.stock;
+};
+
+// POST /api/v1/cart/stock-check   (open to guests: it only reads stock)
+// Tells the cart page which lines can't be bought as they are
+exports.checkCartStock = async (req, res) => {
+    const { items } = req.body;
+    if (!Array.isArray(items)) return fail(res, 400, 'Your cart is invalid');
+
+    // Same merging as newOrder, but unusable lines are skipped instead of rejected
+    const lines = new Map();
+    for (const item of items.slice(0, 100)) {
+        const quantity = Number(item?.quantity);
+        if (
+            !mongoose.isValidObjectId(item?.product) ||
+            typeof item.size !== 'string' ||
+            typeof item.color !== 'string' ||
+            !Number.isInteger(quantity) ||
+            quantity < 1
+        ) {
+            continue;
+        }
+        const key = `${item.product}|${item.size}|${item.color}`;
+        const line = lines.get(key);
+        if (line) line.quantity += quantity;
+        else lines.set(key, { product: item.product, size: item.size, color: item.color, quantity });
+    }
+    const requested = [...lines.values()];
+
+    const products = await Product.find({ _id: { $in: requested.map((l) => l.product) } });
+    const productMap = new Map(products.map((p) => [String(p._id), p]));
+
+    const stockIssues = [];
+    for (const line of requested) {
+        const product = productMap.get(String(line.product));
+        const available = getAvailable(product, line);
+        if (available < line.quantity) {
+            stockIssues.push({
+                product: String(line.product),
+                name: product?.name || 'An item',
+                size: line.size,
+                color: line.color,
+                available,
+            });
+        }
+    }
+
+    return res.status(200).json({ success: true, stockIssues });
+};
+
 // POST /api/v1/order/new
 // The client only sends product, size, color, and quantity. Names, images and
 // prices are read from the database, so they can't be tampered with.
@@ -112,20 +165,20 @@ exports.newOrder = async (req, res) => {
 
     // Build the order lines from the database and do a first stock check
     const builtItems = [];
+    const stockIssues = [];
     for (const line of requested) {
         const product = productMap.get(String(line.product));
-        if (!product || product.isActive === false) return fail(res, 400, 'A product in your cart is no longer available');
+        const available = getAvailable(product, line);
 
-        const variant = product.variants.find((v) => v.size === line.size && v.color === line.color);
-        if (!variant) {
-            return fail(res, 400, `${product.name} is no longer available in ${line.size} / ${line.color}`);
-        }
-        if (variant.stock < line.quantity) {
-            const message =
-                variant.stock === 0
-                    ? `${product.name} (${line.size} / ${line.color}) is out of stock`
-                    : `Only ${variant.stock} left of ${product.name} (${line.size} / ${line.color})`;
-            return fail(res, 400, message);
+        if (available < line.quantity) {
+            stockIssues.push({
+                product: String(line.product),
+                name: product?.name || 'An item',
+                size: line.size,
+                color: line.color,
+                available,
+            });
+            continue;
         }
 
         builtItems.push({
@@ -136,6 +189,14 @@ exports.newOrder = async (req, res) => {
             color: line.color,
             price: product.price,
             quantity: line.quantity,
+        });
+    }
+
+    if (stockIssues.length > 0) {
+        return res.status(409).json({
+            success: false,
+            message: 'Some items in your cart are no longer available',
+            stockIssues,
         });
     }
 
@@ -313,6 +374,12 @@ const buildBuckets = (from, to, granularity) => {
         }
     }
     return buckets;
+};
+
+// The number on the Orders badge in the admin sidebar: orders still waiting for the admin
+exports.processingCount = async (req, res) => {
+    const count = await Order.countDocuments({ orderStatus: 'Processing' });
+    return res.status(200).json({ success: true, count });
 };
 
 exports.dashboardStats = async (req, res) => {
